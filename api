@@ -1,0 +1,155 @@
+const MIN = parseFloat(process.env.MIN_GRADE || '80');
+const INST = process.env.INSTITUTION || 'Institución';
+const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const NL = '\n';
+const MIMES = ['image/jpeg', 'image/png', 'application/pdf'];
+
+const validEmail = (s) => /^[^ @]+@[^ @]+\.[^ @]+$/.test(String(s || '').trim());
+const tokens = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  .replace(/[^a-z ]/g, ' ').split(' ').filter((x) => x.length > 2);
+
+function ageOf(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
+  if (!m) return null;
+  const t = new Date();
+  let y = t.getFullYear() - +m[1];
+  let mo = t.getMonth() - (+m[2] - 1);
+  if (t.getDate() < +m[3]) mo--;
+  if (mo < 0) { y--; mo += 12; }
+  return y < 0 ? null : y + ' años y ' + mo + ' meses';
+}
+
+async function readDocuments(acta, bol) {
+  const prompt = [
+    'El documento 1 es un acta de nacimiento dominicana y el documento 2 es un boletín de calificaciones escolar.',
+    'Responde SOLO un objeto JSON con estas claves exactas:',
+    'child_name, sex, birth_date, mother_name, father_name, final_average, computed, boletin_student_name',
+    'Reglas:',
+    '- child_name, sex, birth_date, mother_name y father_name vienen del acta.',
+    '- sex es M o F. birth_date en formato AAAA-MM-DD.',
+    '- final_average viene del boletín: la calificación final general o promedio general del año, número de 0 a 100.',
+    '- Si el boletín no trae ese promedio, calcula el promedio de las calificaciones finales de las asignaturas y pon computed en true; si está escrito, computed es false.',
+    '- boletin_student_name es el nombre del estudiante en el boletín.',
+    '- Usa null para lo que no se vea con claridad. No adivines.'
+  ].join(NL);
+
+  const body = {
+    contents: [{
+      parts: [
+        { text: 'Documento 1 (acta de nacimiento):' },
+        { inlineData: { mimeType: acta.mime, data: acta.data } },
+        { text: 'Documento 2 (boletín de notas):' },
+        { inlineData: { mimeType: bol.mime, data: bol.data } },
+        { text: prompt }
+      ]
+    }],
+    generationConfig: { responseMimeType: 'application/json', temperature: 0 }
+  };
+
+  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + MODEL + ':generateContent', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY || '' },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) throw new Error('Servicio de IA ' + r.status + ': ' + (await r.text()).slice(0, 200));
+  const j = await r.json();
+  const text = (((j.candidates || [])[0] || {}).content || {}).parts;
+  const raw = (text || []).map((p) => p.text || '').join('');
+  const s = raw.indexOf('{'), e = raw.lastIndexOf('}');
+  if (s < 0 || e < 0) throw new Error('La IA no devolvió datos.');
+  return JSON.parse(raw.slice(s, e + 1));
+}
+
+module.exports = async (req, res) => {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Método no permitido.' });
+  try {
+    const p = req.body || {};
+    for (const f of [p.acta, p.foto, p.bol]) {
+      if (!f || !f.data || !MIMES.includes(f.mime)) {
+        return res.status(400).json({ error: 'Faltan documentos obligatorios o tienen un formato no válido (use JPG, PNG o PDF).' });
+      }
+    }
+
+    const admin = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+    const allowed = [admin].concat(String(process.env.ALLOWED_EMAILS || '').split(','))
+      .map((x) => x.trim().toLowerCase()).filter(validEmail);
+    const wanted = String(p.to || '').trim().toLowerCase();
+    const to = allowed.includes(wanted) ? wanted : admin;
+
+    let d;
+    try { d = await readDocuments(p.acta, p.bol); }
+    catch (err) { return res.status(502).json({ error: 'No se pudieron leer los documentos. Intente con fotos más claras. (' + err.message + ')' }); }
+
+    const child = String(d.child_name || '').trim();
+    const mother = String(d.mother_name || '').trim();
+    const father = String(d.father_name || '').trim();
+    const sx = String(d.sex || '').toUpperCase().charAt(0);
+    const sex = sx === 'F' ? 'Femenino' : sx === 'M' ? 'Masculino' : '';
+    const age = ageOf(d.birth_date);
+    const grade = parseFloat(String(d.final_average).replace(',', '.'));
+
+    const missing = [];
+    if (!child) missing.push('nombre del hijo/a');
+    if (!age) missing.push('fecha de nacimiento');
+    if (!sex) missing.push('sexo');
+    if (!mother) missing.push('nombre de la madre');
+    if (!father) missing.push('nombre del padre');
+    if (isNaN(grade) || grade < 0 || grade > 100) missing.push('calificación del boletín');
+    if (missing.length) {
+      return res.status(422).json({ error: 'No se pudo leer: ' + missing.join(', ') + '. Suba fotos más claras, completas y de frente.' });
+    }
+
+    const warnings = [];
+    if (d.computed) warnings.push('La calificación se calculó como promedio de las asignaturas (el boletín no trae promedio final).');
+    const a = tokens(child), b = tokens(d.boletin_student_name);
+    if (a.length && b.length) {
+      const common = a.filter((x) => b.includes(x)).length;
+      if (common < Math.min(2, a.length, b.length)) warnings.push('El nombre del boletín (' + d.boletin_student_name + ') no coincide con el del acta.');
+    }
+
+    const approved = grade >= MIN;
+    const status = approved ? 'APROBADA' : 'RECHAZADA';
+    const comunicado = approved
+      ? 'La solicitud cumple con la calificación mínima requerida (' + MIN + ').'
+      : 'Lamentamos informar que la solicitud fue RECHAZADA porque la calificación (' + grade + ') es menor al mínimo requerido de ' + MIN + '.';
+
+    const lines = [
+      'Nueva solicitud recibida. Los datos fueron leídos automáticamente de los documentos.', '',
+      'Hijo/a: ' + child, 'Sexo: ' + sex, 'Fecha de nacimiento: ' + d.birth_date, 'Edad: ' + age,
+      'Madre: ' + mother, 'Padre: ' + father, 'Calificación: ' + grade, 'Resultado: ' + status, '',
+      comunicado, '', 'Adjuntos: acta de nacimiento, foto 2x2 y boletín de notas.',
+      'Compare los datos leídos con los documentos adjuntos.'
+    ];
+    if (warnings.length) lines.push('', 'Advertencias:', '- ' + warnings.join(NL + '- '));
+
+    const ext = (m) => (m === 'application/pdf' ? '.pdf' : m === 'image/png' ? '.png' : '.jpg');
+    const mail = {
+      sender: { name: INST, email: process.env.SENDER_EMAIL },
+      to: [{ email: to }],
+      subject: '[' + status + '] Solicitud de ' + child,
+      textContent: lines.join(NL),
+      attachment: [
+        { name: 'acta' + ext(p.acta.mime), content: p.acta.data },
+        { name: 'foto2x2' + ext(p.foto.mime), content: p.foto.data },
+        { name: 'boletin' + ext(p.bol.mime), content: p.bol.data }
+      ]
+    };
+    if (to !== admin) mail.bcc = [{ email: admin }];
+
+    const m = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'api-key': process.env.BREVO_API_KEY || '' },
+      body: JSON.stringify(mail)
+    });
+    if (!m.ok) return res.status(502).json({ error: 'No se pudo enviar el correo (' + m.status + ').' });
+
+    return res.status(200).json({
+      approved,
+      message: approved
+        ? 'Gracias. Su solicitud fue recibida y cumple con la calificación mínima.'
+        : 'Su solicitud fue recibida, pero la calificación (' + grade + ') es menor al mínimo requerido de ' + MIN + '.'
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'Error inesperado: ' + err.message });
+  }
+};
